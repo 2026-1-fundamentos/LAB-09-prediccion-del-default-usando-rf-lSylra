@@ -92,3 +92,174 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import gzip
+import json
+import pickle
+import pandas as pd
+
+from sklearn.model_selection import GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    precision_score, balanced_accuracy_score,
+    recall_score, f1_score, confusion_matrix
+)
+
+# ---------------------------
+# Utilidades de carga
+# ---------------------------
+
+def load_csv_zip(path):
+    """Carga un archivo CSV comprimido."""
+    return pd.read_csv(path)
+
+
+def unify_education_levels(value):
+    """Agrupa niveles superiores de educación en la categoría 4 (others)."""
+    return value if value <= 4 else 4
+
+
+def prepare_dataset(frame):
+    """Limpieza general del dataset según los pasos requeridos."""
+    df = frame.rename(columns={"default payment next month": "default"})
+    df = df.drop(columns=["ID"])
+    df = df.dropna()
+    df["EDUCATION"] = df["EDUCATION"].apply(unify_education_levels)
+    return df
+
+
+# ---------------------------
+# Carga y preparación
+# ---------------------------
+
+training_raw = load_csv_zip("files/input/train_data.csv.zip")
+testing_raw = load_csv_zip("files/input/test_data.csv.zip")
+
+training = prepare_dataset(training_raw)
+testing = prepare_dataset(testing_raw)
+
+X_tr = training.drop(columns=["default"])
+y_tr = training["default"]
+
+X_te = testing.drop(columns=["default"])
+y_te = testing["default"]
+
+
+# ---------------------------
+# Pipeline
+# ---------------------------
+
+def build_pipeline(cat_cols):
+    """Crea el pipeline de transformación + modelo."""
+    transformer = ColumnTransformer(
+        [("categorical", OneHotEncoder(handle_unknown="ignore"), cat_cols)],
+        remainder="passthrough"
+    )
+
+    model = RandomForestClassifier(random_state=42)
+
+    return Pipeline([
+        ("transform", transformer),
+        ("model", model)
+    ])
+
+
+categorical_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+pipeline = build_pipeline(categorical_cols)
+
+
+# ---------------------------
+# Grid Search
+# ---------------------------
+
+def run_grid_search(pipe, x, y):
+    """Optimización de hiperparámetros con validación cruzada."""
+    param_grid = {
+        "model__n_estimators": [50, 100, 200],
+        "model__max_depth": [None, 10, 20],
+        "model__min_samples_split": [2, 5],
+        "model__min_samples_leaf": [1, 2],
+    }
+
+    search = GridSearchCV(
+        pipe,
+        param_grid=param_grid,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        verbose=2,
+        refit=True,
+    )
+
+    search.fit(x, y)
+    return search
+
+
+best_estimator = run_grid_search(pipeline, X_tr, y_tr)
+
+
+# ---------------------------
+# Guardado del modelo gzip
+# ---------------------------
+
+def save_gzip_model(model, filepath):
+    """Guarda el modelo comprimido en formato gzip."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with gzip.open(filepath, "wb") as f:
+        pickle.dump(model, f)
+
+
+save_gzip_model(best_estimator, "files/models/model.pkl.gz")
+
+
+# ---------------------------
+# Métricas
+# ---------------------------
+
+def build_metric(model, x, y, dataset_name):
+    preds = model.predict(x)
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": precision_score(y, preds, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y, preds),
+        "recall": recall_score(y, preds, zero_division=0),
+        "f1_score": f1_score(y, preds, zero_division=0)
+    }
+
+
+def build_confusion_dict(model, x, y, dataset_name):
+    preds = model.predict(x)
+    cm = confusion_matrix(y, preds)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+        "true_1": {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])},
+    }
+
+
+results = [
+    build_metric(best_estimator, X_tr, y_tr, "train"),
+    build_metric(best_estimator, X_te, y_te, "test"),
+    build_confusion_dict(best_estimator, X_tr, y_tr, "train"),
+    build_confusion_dict(best_estimator, X_te, y_te, "test"),
+]
+
+
+# ---------------------------
+# Guardado de métricas
+# ---------------------------
+
+def write_metrics_to_file(entries, out_path):
+    """Escribe cada métrica como una línea JSON independiente."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
+
+write_metrics_to_file(results, "files/output/metrics.json")
